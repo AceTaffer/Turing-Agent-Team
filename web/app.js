@@ -470,8 +470,8 @@ function setMsgStatus(bodyEl, st) {
  el.dataset.st = st
  el.textContent = st === 'done' ? t('stDone') : st === 'failed' ? t('stFailed') : st === 'answering' ? t('stAnswering') + '…' : t('stThinking') + '…'
 }
-// ★ 上下文占用环形指示器（悬停显示 成本/使用率/Token），用于对话消息与团队角色块
-function setCtxBadge(host, pct, cost, tokens) {
+// ★ 上下文占用环形指示器（悬停显示 费用/使用率/Token/缓存命中），用于对话消息与团队角色块
+function setCtxBadge(host, pct, cost, tokens, cacheHit) {
  if (!host) return
  const head = host.querySelector('.agent-head') || host
  let el = head.querySelector('.ctx-ring')
@@ -480,7 +480,7 @@ function setCtxBadge(host, pct, cost, tokens) {
  el.className = 'ctx-ring ' + cls
  const off = Math.max(0, 100 - Math.min(100, Number(pct) || 0))
  el.innerHTML = `<svg viewBox="0 0 36 36"><circle class="ring-bg" cx="18" cy="18" r="15.9155"></circle><circle class="ring-fg" cx="18" cy="18" r="15.9155" stroke-dasharray="100" stroke-dashoffset="${off}"></circle></svg>
- <span class="ctx-tip"><span class="ctx-tip-row"><i>${t('cost')}</i><b>${fmtCost(cost)}</b></span><span class="ctx-tip-row"><i>${t('usageRate')}</i><b>${pct}%</b></span><span class="ctx-tip-row"><i>Token</i><b>${fmtNum(tokens)}</b></span></span>`
+ <span class="ctx-tip"><span class="ctx-tip-row"><i>${t('cost')}</i><b>${fmtCost(cost)}</b></span><span class="ctx-tip-row"><i>${t('usageRate')}</i><b>${pct}%</b></span><span class="ctx-tip-row"><i>Token</i><b>${fmtNum(tokens)}</b></span><span class="ctx-tip-row"><i>${t('cache')}</i><b>${fmtNum(cacheHit)}</b></span></span>`
 }
 // ★ 删除会话弹窗：返回 'cancel' | 'chat' | 'purge'
 function askDeleteSession(title, workspace) {
@@ -826,6 +826,12 @@ function renderSidebar() {
  ${list2.map((s) => `<div class="session-item ${s.id === state.activeSession?.id ? 'active' : ''} ${s.archived ? 'archived' : ''}" data-sid="${s.id}">
  <div class="s-title">${esc(s.title || '(untitled)')}</div>
  <div class="s-meta dim small">${new Date(s.updatedAt).toLocaleDateString()} · ${s.messageCount} · ${fmtCost(s.cost)}</div>
+ <span class="sess-tip ctx-tip">
+ <span class="ctx-tip-row"><i>${t('cost')}</i><b>${fmtCost(s.cost)}</b></span>
+ <span class="ctx-tip-row"><i>${t('usageRate')}</i><b>${s.contextLimit ? Math.min(999, Math.round((s.lastPrompt || 0) / s.contextLimit * 100)) + '%' : '--'}</b></span>
+ <span class="ctx-tip-row"><i>Token</i><b>${fmtNum(s.lastPrompt)}${s.contextLimit ? '/' + fmtNum(s.contextLimit) : ''}</b></span>
+ <span class="ctx-tip-row"><i>${t('cache')}</i><b>${fmtNum(s.cacheHitTokens)}</b></span>
+ </span>
  <span class="s-actions">
  <button class="mini" data-act="rename" data-sid="${s.id}" title="rename">✎</button>
   <button class="mini" data-act="archive" data-sid="${s.id}" title="archive">${s.archived ? '↩' : '▣'}</button>
@@ -1047,7 +1053,7 @@ function appendMsg(role, content, meta, idx) {
   const metaEl = document.createElement('div')
   metaEl.className = 'msg-meta dim small'
   const pct = meta.contextLimit ? Math.min(999, Math.round((meta.usage.prompt_tokens || 0) / meta.contextLimit * 100)) : null
-  if (pct != null) setCtxBadge(metaEl, pct, meta.cost, (meta.usage.prompt_tokens || 0) + (meta.usage.completion_tokens || 0))
+  if (pct != null) setCtxBadge(metaEl, pct, meta.cost, (meta.usage.prompt_tokens || 0) + (meta.usage.completion_tokens || 0), hit)
   metaEl.insertAdjacentHTML('beforeend', ` <span>${t('tokens')} ${fmtNum(meta.usage.prompt_tokens)}/${fmtNum(meta.usage.completion_tokens)} · ${t('cache')} ${fmtNum(hit)} · ${t('cost')} ${fmtCost(meta.cost)}</span>`)
   el.appendChild(metaEl)
  }
@@ -1200,7 +1206,7 @@ async function sendChat() {
    let meta = target.parentElement.querySelector('.msg-meta')
    if (!meta) { meta = document.createElement('div'); meta.className = 'msg-meta dim small'; target.parentElement.appendChild(meta) }
    meta.innerHTML = ''
-   if (pctNum != null) setCtxBadge(meta, pctNum, j.cost, (j.usage.prompt_tokens || 0) + (j.usage.completion_tokens || 0))
+   if (pctNum != null) setCtxBadge(meta, pctNum, j.cost, (j.usage.prompt_tokens || 0) + (j.usage.completion_tokens || 0), j.cacheHit)
    meta.insertAdjacentHTML('beforeend', ` <span>${t('tokens')} ${fmtNum(j.usage.prompt_tokens)}/${fmtNum(j.usage.completion_tokens)} · ${t('cache')} ${fmtNum(j.cacheHit)} · ${t('cost')} ${fmtCost(j.cost)}</span>`)
   }
  } catch {}
@@ -1476,6 +1482,17 @@ function renderRoleActivity() {
  box.querySelectorAll('.role-chip[data-role]').forEach((el) => { el.onclick = () => { setTeamFocus(el.dataset.role); switchSubtab('roles') } })
  renderTeamTabs()
 }
+// ★ 角色卡片指标行：费用 / 使用率 / Token / 缓存命中（与环形提示一致）
+function roleStatsHtml(id) {
+ const st = (state.roleLive[id] || {}).stats
+ if (!st || (!st.prompt && !st.cost)) return ''
+ const pct = st.ctxLimit ? Math.round((st.lastPrompt || 0) / st.ctxLimit * 100) + '%' : '--'
+ return `费用 ${fmtCost(st.cost)} · 使用率 ${pct} · Token ${fmtNum(st.prompt)}/${fmtNum(st.completion)} · ${t('cache')} ${fmtNum(st.cacheHit)}`
+}
+function updateRoleStatsEl(id) {
+ const el = document.querySelector(`.role-col[data-role="${id}"] .rc-stats`)
+ if (el) el.textContent = roleStatsHtml(id)
+}
 function renderRolesLive() {
  const box = $('roles-live')
  if (!box) return
@@ -1485,6 +1502,7 @@ function renderRolesLive() {
  return `<div class="role-col" data-role="${r.id}" data-st="${rl.status || 'idle'}">
  <div class="rc-head"><span class="role-dot" style="background:${esc(r.color || '#888')}"></span><b>${esc(r.label)}</b><span class="rc-head-status dim small">${esc(stLabel(rl.status || 'idle'))}</span></div>
  <div class="rc-sub dim small">${esc([rl.model, rl.sub].filter(Boolean).join(' · '))}</div>
+ <div class="rc-stats dim small">${esc(roleStatsHtml(r.id))}</div>
  <div class="rc-tools">${(rl.tools || []).map((x) => `<div class="rc-tool"> ${esc(x.call)} ${esc(x.detail || '')}</div>`).join('')}</div>
  <div class="rc-text">${esc(rl.acc || '')}</div>
  </div>`
@@ -1724,7 +1742,7 @@ async function roleChatSend() {
       el.innerHTML = `<summary>${t('toolLabel')} · ${esc(j.tool)}</summary><div>${esc(String(j.result || '').slice(0, 1500))}</div>`
       box.appendChild(el)
      }
-     if (j.usage && j.contextLimit) setCtxBadge(box, Math.round((j.usage.prompt_tokens || 0) / j.contextLimit * 100), j.cost, (j.usage.prompt_tokens || 0) + (j.usage.completion_tokens || 0))
+     if (j.usage && j.contextLimit) setCtxBadge(box, Math.round((j.usage.prompt_tokens || 0) / j.contextLimit * 100), j.cost, (j.usage.prompt_tokens || 0) + (j.usage.completion_tokens || 0), j.cacheHit)
      if (j.question || j.confirm || j.ask || j.ask_done || j.tool) scrollIfNearBottom($('team-stream'))
     } catch { /* ignore */ }
    }
@@ -1867,17 +1885,29 @@ function handleTeamEvent(ev, run, ref) {
  if (ev.call === 'generate_image' || ev.call === 'generate_video') appendMediaCard(run.body, ev.result)
  applyTeamFilter(); return
  }
-  if (ev.type === 'usage') {
-   if (ev.cost) { run.cost += ev.cost; run.foot.textContent = ` ${fmtCost(run.cost)} · ${t('tokens')} ${fmtNum(ev.usage?.prompt_tokens)}/${fmtNum(ev.usage?.completion_tokens)} · ${t('cache')} ${fmtNum(ev.cacheHit)}` }
-   state.teamTaskCost = ev.totalCost != null ? Number(ev.totalCost) : (Number(state.teamTaskCost) || 0) + (Number(ev.cost) || 0)
-   renderTeamBudget()
-   const last = Object.values(ref.stepBoxes).filter((s) =>s.agent === ev.agent).pop()
-   if (last?.body) last.body.parentElement.insertAdjacentHTML('beforeend', `<div class="dim small"> ${fmtNum(ev.usage?.prompt_tokens)}/${fmtNum(ev.usage?.completion_tokens)} · ${t('cache')} ${fmtNum(ev.cacheHit)} · ${fmtCost(ev.cost)}</div>`)
+   if (ev.type === 'usage') {
+    if (ev.cost) { run.cost += ev.cost; run.foot.textContent = ` ${fmtCost(run.cost)} · ${t('tokens')} ${fmtNum(ev.usage?.prompt_tokens)}/${fmtNum(ev.usage?.completion_tokens)} · ${t('cache')} ${fmtNum(ev.cacheHit)}` }
+    state.teamTaskCost = ev.totalCost != null ? Number(ev.totalCost) : (Number(state.teamTaskCost) || 0) + (Number(ev.cost) || 0)
+    renderTeamBudget()
+    // ★ 团队角色卡片指标累计（费用/使用率/Token/缓存命中）
+    try {
+     const rl = roleLiveOf(ev.agent)
+     rl.stats = rl.stats || { cost: 0, prompt: 0, completion: 0, cacheHit: 0, lastPrompt: 0, ctxLimit: 0 }
+     rl.stats.cost += Number(ev.cost) || 0
+     rl.stats.prompt += ev.usage?.prompt_tokens || 0
+     rl.stats.completion += ev.usage?.completion_tokens || 0
+     rl.stats.cacheHit += Number(ev.cacheHit) || 0
+     if (ev.usage?.prompt_tokens) rl.stats.lastPrompt = ev.usage.prompt_tokens
+     if (ev.contextLimit) rl.stats.ctxLimit = ev.contextLimit
+     updateRoleStatsEl(ev.agent)
+    } catch { /* ignore */ }
+    const last = Object.values(ref.stepBoxes).filter((s) =>s.agent === ev.agent).pop()
+    if (last?.body) last.body.parentElement.insertAdjacentHTML('beforeend', `<div class="dim small"> ${fmtNum(ev.usage?.prompt_tokens)}/${fmtNum(ev.usage?.completion_tokens)} · ${t('cache')} ${fmtNum(ev.cacheHit)} · ${fmtCost(ev.cost)}</div>`)
    // ★ 每个角色块的上下文占用环形指示器
    if (ev.usage && ev.contextLimit) {
     const pct = Math.min(999, Math.round((ev.usage.prompt_tokens || 0) / ev.contextLimit * 100))
     const host = last?.body ? last.body.parentElement : (ev.agent === 'leader' && ref.finalBox ? ref.finalBox.parentElement : null)
-    setCtxBadge(host, pct, ev.cost, (ev.usage.prompt_tokens || 0) + (ev.usage.completion_tokens || 0))
+    setCtxBadge(host, pct, ev.cost, (ev.usage.prompt_tokens || 0) + (ev.usage.completion_tokens || 0), ev.cacheHit)
    }
    return
   }

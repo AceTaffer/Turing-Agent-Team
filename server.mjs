@@ -2563,7 +2563,19 @@ if ($res -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dlg.Select
   }
   // ★ 会话管理
   if (pathname === '/api/sessions' && method === 'GET') {
-    return sendJson(res, 200, { ok: true, sessions: sessions.map((s) => ({ id: s.id, kind: s.kind || 'chat', providerId: s.providerId, model: s.model, title: s.title, workspace: s.workspace, archived: !!s.archived, permission: s.permission || settings.defaultPermission || 'modify', autoApprove: !!s.autoApprove, messageCount: s.messages?.length || 0, tokens: s.tokens || 0, cost: s.cost || 0, createdAt: s.createdAt, updatedAt: s.updatedAt })) })
+    return sendJson(res, 200, {
+      ok: true,
+      sessions: sessions.map((s) => {
+        // ★ 会话指标：缓存命中累计 / 最近一次输入 Token / 上下文上限（供悬停卡片显示）
+        let cacheHitTokens = 0, lastPrompt = 0, contextLimit = 0
+        for (const m of s.messages || []) {
+          if (m.usage) { cacheHitTokens += m.usage.prompt_cache_hit_tokens || 0; lastPrompt = m.usage.prompt_tokens || lastPrompt }
+          if (m.contextLimit) contextLimit = m.contextLimit
+        }
+        if (!contextLimit) { try { contextLimit = getContextLimit(providers.find((p) => p.id === s.providerId) || {}, s.model) } catch { contextLimit = 0 } }
+        return { id: s.id, kind: s.kind || 'chat', providerId: s.providerId, model: s.model, title: s.title, workspace: s.workspace, archived: !!s.archived, permission: s.permission || settings.defaultPermission || 'modify', autoApprove: !!s.autoApprove, messageCount: s.messages?.length || 0, tokens: s.tokens || 0, cost: s.cost || 0, cacheHitTokens, lastPrompt, contextLimit, createdAt: s.createdAt, updatedAt: s.updatedAt }
+      }),
+    })
   }
   if (pathname === '/api/sessions' && method === 'POST') {
     const b = await readBody(req)
@@ -2807,7 +2819,7 @@ if ($res -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dlg.Select
           stream: true, temperature: 0.5,
           onDelta: (d) => emit({ delta: d, turn }),
           onReasoning: (r) => emit({ reasoning: r, turn }),
-          onUsage: (u) => { const cost = calcCost(getPrice(target.provider, target.model), u); statsAdd({ role: role.id, model: target.model, usage: u, cost: cost || 0 }); emit({ usage: u, cost, contextLimit: getContextLimit(target.provider, target.model), turn }) },
+          onUsage: (u) => { const cost = calcCost(getPrice(target.provider, target.model), u); statsAdd({ role: role.id, model: target.model, usage: u, cost: cost || 0 }); emit({ usage: u, cost, cacheHit: u?.prompt_cache_hit_tokens || 0, contextLimit: getContextLimit(target.provider, target.model), turn }) },
         })
         if (!text.trim()) break
         lastText = text
