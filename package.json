@@ -1,0 +1,15 @@
+{
+  "name": "turing-agent-team",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "desktop/main.cjs",
+  "description": "★ Turing Agent Team（TAT）：Open Agent Team 的进阶版——桌面端 + 安卓手机端互联，远程监控与操控团队任务；致敬艾伦·图灵。",
+  "scripts": {
+    "start": "node server.mjs",
+    "desktop": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^44.4.5"
+  }
+}
