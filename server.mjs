@@ -1624,7 +1624,7 @@ async function runTeam(task, opts = {}) {
   try {
     for (let turn = 0; turn < 4; turn++) {
       if (!(await gate('leader'))) break
-      leaderText = await chatComplete(leader.provider, leader.model, leaderMsgs, { stream: true, temperature: 0.4, reasoningEffort: leaderEmptyRetried ? 'none' : undefined, onDelta: (d) => send({ type: 'delta', agent: 'leader', text: d }), onReasoning: (r) => send({ type: 'reasoning', agent: 'leader', text: r }), onUsage: trackUsage('leader', leader.provider, leader.model) })
+      leaderText = await chatComplete(leader.provider, leader.model, leaderMsgs, { stream: true, temperature: 0.4, reasoningEffort: leaderEmptyRetried ? 'none' : (sess?.effort || undefined), onDelta: (d) => send({ type: 'delta', agent: 'leader', text: d }), onReasoning: (r) => send({ type: 'reasoning', agent: 'leader', text: r }), onUsage: trackUsage('leader', leader.provider, leader.model) })
       if (!leaderText.trim()) {
         if (leaderEmptyRetried) break
         leaderEmptyRetried = true
@@ -1729,7 +1729,8 @@ async function runTeam(task, opts = {}) {
         }
         if (sess) saveSessions().catch(() => {})
         // ★ 空正文重试时关闭思考（reasoning_effort=none）：避免再次把全部输出预算烧在思考里
-        const effortOverride = emptyRetried ? 'none' : undefined
+        // ★ 推理等级：优先用该团队会话的滑块设置（sess.effort）
+        const effortOverride = emptyRetried ? 'none' : (sess?.effort || undefined)
         const turnText = await chatComplete(agent.provider, agent.model, messages, { stream: true, temperature: 0.4, reasoningEffort: effortOverride, onDelta: (d) => send({ type: 'delta', agent: roleId, text: d, turn }), onReasoning: (r) => send({ type: 'reasoning', agent: roleId, text: r, turn }), onUsage: trackUsage(roleId, agent.provider, agent.model) })
         stepText += turnText
         // ★ 推理模型可能把输出预算全耗在思考里（正文为空）：只重试一次，且关闭思考
@@ -1845,7 +1846,7 @@ async function runTeam(task, opts = {}) {
         if (budgetStopped || run.abort) break
         if (!(await gate('*'))) break
         turn++
-        const text = await chatComplete(leader.provider, leader.model, messages, { stream: true, temperature: 0.4, onDelta: (d) => send({ type: 'delta', agent: 'leader', text: d, final: true }), onReasoning: (r) => send({ type: 'reasoning', agent: 'leader', text: r, final: true }), onUsage: trackUsage('leader', leader.provider, leader.model) })
+        const text = await chatComplete(leader.provider, leader.model, messages, { stream: true, temperature: 0.4, reasoningEffort: sess?.effort || undefined, onDelta: (d) => send({ type: 'delta', agent: 'leader', text: d, final: true }), onReasoning: (r) => send({ type: 'reasoning', agent: 'leader', text: r, final: true }), onUsage: trackUsage('leader', leader.provider, leader.model) })
         if (!text.trim()) break
         finalText = text
         const calls = extractToolCalls(text)
@@ -2455,7 +2456,7 @@ if ($res -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dlg.Select
         const tIdx = turn
         const text = await chatComplete(provider, modelId, history, {
           stream: true, temperature: body.temperature ?? 0.7, sessionId: session?.id,
-          reasoningEffort: emptyRetried ? 'none' : undefined,
+          reasoningEffort: emptyRetried ? 'none' : (session?.effort || undefined),
           onDelta: (d) => emit({ delta: d, turn: tIdx }),
           // ★ 思考过程随会话持久化（刷新后仍可回看），推理模型才有
           onReasoning: (r) => { turnReasoning += r; emit({ reasoning: r, turn: tIdx }) },
@@ -2573,7 +2574,7 @@ if ($res -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dlg.Select
           if (m.contextLimit) contextLimit = m.contextLimit
         }
         if (!contextLimit) { try { contextLimit = getContextLimit(providers.find((p) => p.id === s.providerId) || {}, s.model) } catch { contextLimit = 0 } }
-        return { id: s.id, kind: s.kind || 'chat', providerId: s.providerId, model: s.model, title: s.title, workspace: s.workspace, archived: !!s.archived, permission: s.permission || settings.defaultPermission || 'modify', autoApprove: !!s.autoApprove, messageCount: s.messages?.length || 0, tokens: s.tokens || 0, cost: s.cost || 0, cacheHitTokens, lastPrompt, contextLimit, createdAt: s.createdAt, updatedAt: s.updatedAt }
+        return { id: s.id, kind: s.kind || 'chat', providerId: s.providerId, model: s.model, title: s.title, workspace: s.workspace, archived: !!s.archived, permission: s.permission || settings.defaultPermission || 'modify', autoApprove: !!s.autoApprove, effort: s.effort || '', messageCount: s.messages?.length || 0, tokens: s.tokens || 0, cost: s.cost || 0, cacheHitTokens, lastPrompt, contextLimit, createdAt: s.createdAt, updatedAt: s.updatedAt }
       }),
     })
   }
@@ -2606,6 +2607,8 @@ if ($res -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dlg.Select
       if (b.workspace != null) s.workspace = b.workspace
       if (b.permission != null && PERMISSIONS.includes(b.permission)) s.permission = b.permission
       if (b.autoApprove != null) s.autoApprove = !!b.autoApprove
+      // ★ 推理等级（拖动滑块）：''=跟随全局；none/low/high/max/default
+      if (b.effort != null && ['', 'none', 'low', 'high', 'max', 'default'].includes(b.effort)) s.effort = b.effort
       s.updatedAt = Date.now(); await saveSessions()
       return sendJson(res, 200, { ok: true, session: s })
     }
