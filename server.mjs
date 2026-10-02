@@ -597,7 +597,9 @@ function skillTextFor(role) {
 function withSkillsAndTools(role, base) {
   // ★ 协作规则：队友之间直接沟通立即回复，只有重大/无法判断的事项才交给用户
   const collabRule = '【协作规则】需要队友的信息、确认或配合时，直接用 ask_role 联系对方（对方会立即自动回复），不要停下来等用户转达；只有涉及重大决策、需求冲突或信息不足以判断时才用 ask_user 请用户裁决。'
-  return [base, skillTextFor(role), collabRule, BASE_TOOL_PROTOCOL + pluginToolDoc() + vaultToolDoc() + jsToolDoc()].filter(Boolean).join('\n\n')
+  // ★ 上下文复用：优先使用系统附带的记忆/档案/快照，避免反复读取项目文件（省 token、快、准）
+  const reuseRule = '【上下文复用】你的对话历史中包含长期记忆；消息中可能附有「工作区快照」「团队会话档案」。请优先依据这些内容判断当前进度与产物，不要惯性重复 list_files/read_file 全量翻查；仅在确需文件细节时按需读取个别文件。做完事情后请用一两句总结「我做了什么、产物在哪」，便于之后回忆与交接。'
+  return [base, skillTextFor(role), collabRule, reuseRule, BASE_TOOL_PROTOCOL + pluginToolDoc() + vaultToolDoc() + jsToolDoc()].filter(Boolean).join('\n\n')
 }
 function chatSystemPrompt(root = getActiveRoot()) {
   // ★ 单智能体对话：允许直接操作工作区（写文件/跑命令），避免只返回文本
@@ -626,6 +628,7 @@ function leaderSystemPrompt(role) {
   const flowText = flowTips.length ? `\n推荐协作流：${flowTips.join('；')}。` : ''
   // ★ 规划规则永远附加（即使用户给队长写了自定义提示词，也必须遵守 JSON 计划格式，否则整个任务无法启动）
   const rules = `【规划规则】你只负责规划与汇总，不要执行任务本身、不要写代码或文件。
+【上下文复用】规划前先阅读消息中附带的「工作区快照 / 团队会话档案 / 你的记忆」，据此判断项目当前进度，避免重复翻查文件；仅当信息不足时再读取个别文件。
 规划阶段可用的工具：web_search/web_fetch（调研题材背景）、ask_user（向用户提问澄清需求，会暂停等待用户回答）、ask_role（与队员商量）。
 【必须】凡是需求存在不明确之处（如题材细节、画风、运行形式、玩法、交付物、素材规格等），你必须先调用 ask_user 逐项向用户提问（每题给出 2~4 个合理选项 + 允许自填），拿到用户答复后才能排出最终计划；禁止自行假设答案代替用户选择。用户已明确的信息才可跳过提问。
 收到用户任务后，用 2~4 行说明分工思路，然后在最后输出一个 JSON 计划（\`\`\`json 代码块）：
@@ -919,7 +922,7 @@ async function askRoleImpl(call, ctx = {}) {
   try {
     const answer = await chatComplete(target.provider, target.model, [
       { role: 'system', content: roleSystemPrompt(role) },
-      ...roleChatHistory(role.id, 8),
+      ...roleChatHistory(role.id, 60, 6000),
       { role: 'user', content: `${ctx.task ? `【总任务】${ctx.task}\n` : ''}【来自队友${caller ? `「${caller.label}」` : ''}的协作询问】${question}\n请用简体中文直接给出你的专业意见，简洁明确（不要调用工具、不要执行任务本身）。` },
     ], {
       stream: false, temperature: 0.4,
@@ -1359,13 +1362,74 @@ const ROLE_CHATS_FILE = path.join(DATA_DIR, 'role-chats.json')
 let roleChats = {}
 async function loadRoleChats() { try { roleChats = JSON.parse(await readFile(ROLE_CHATS_FILE, 'utf8')) } catch { roleChats = {} } }
 const saveRoleChats = () => writeFile(ROLE_CHATS_FILE, JSON.stringify(roleChats, null, 2), 'utf8').catch(() => {})
-function roleChatHistory(roleId, max = 12) { return (roleChats[roleId] || []).slice(-max).map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content || '').slice(0, 3000) })) }
+// ★ 角色记忆：默认返回完整历史（按字符预算裁剪）。只在超预算时才从头部大块裁剪，
+//   平时保持"只追加"，让【系统提示 + 历史】成为稳定前缀 → 上游 prompt cache 更容易命中（少花钱、少等待）
+function roleChatHistory(roleId, maxMsgs = 200, maxChars = 14000) {
+  const arr = (roleChats[roleId] || []).slice(-maxMsgs)
+  const out = []
+  let total = 0
+  for (let i = arr.length - 1; i >= 0; i--) {
+    const content = String(arr[i].content || '').slice(0, 4000)
+    total += content.length
+    out.unshift({ role: arr[i].role === 'assistant' ? 'assistant' : 'user', content })
+    if (total > maxChars) break
+  }
+  return out
+}
 function roleChatAppend(roleId, role, content) {
   if (!roleId || !content || !String(content).trim()) return
   const arr = roleChats[roleId] || (roleChats[roleId] = [])
   arr.push({ role, content: String(content).slice(0, 4000), t: Date.now() })
-  while (arr.length > 60) arr.shift()
+  while (arr.length > 200) arr.shift() // ★ 保留更多历史，避免"做完就忘"
   saveRoleChats()
+}
+// ★ 工作区快照（项目档案）：把文件树的"现状"直接喂给 AI，避免每次都反复 list_files/read_file
+const digestCache = new Map()
+async function projectDigest(root, maxEntries = 60) {
+  try {
+    const hit = digestCache.get(root)
+    if (hit && Date.now() - hit.at < 15000) return hit.text
+    const lines = []
+    const walk = async (dir, prefix, depth) => {
+      if (lines.length >= maxEntries || depth > 2) return
+      const es = await readdir(dir, { withFileTypes: true }).catch(() => [])
+      for (const e of es) {
+        if (lines.length >= maxEntries) break
+        if (['node_modules', '.git', 'uploads'].includes(e.name) || e.name.startsWith('.')) continue
+        const p = path.join(dir, e.name)
+        if (e.isDirectory()) {
+          const n = (await readdir(p).catch(() => [])).length
+          lines.push(`${prefix}${e.name}/  (${n} 项)`)
+          await walk(p, prefix + e.name + '/', depth + 1)
+        } else {
+          const st = await stat(p).catch(() => null)
+          lines.push(`${prefix}${e.name}  (${st ? Math.round(st.size / 1024) + 'KB' : '?'})`)
+        }
+      }
+    }
+    await walk(root, '', 0)
+    const text = `【工作区快照（自动生成，请直接据此行动，避免重复 list_files/read_file 全量翻查）】\n目录：${root}\n${lines.join('\n') || '(空目录)'}`
+    digestCache.set(root, { at: Date.now(), text })
+    return text
+  } catch { return '' }
+}
+// ★ 团队会话档案：让角色单独对话时也能"记得"本项目的任务/步骤/产物/协作历史
+function sessionArchive(sess, maxChars = 6000) {
+  if (!sess) return ''
+  const out = []
+  for (const m of sess.messages || []) {
+    if (m.kind === 'team-task') out.push(`【任务】${String(m.content || '').slice(0, 200)}`)
+    else if (m.kind === 'team-plan') out.push(`【计划】${m.summary || ''} → ${(m.steps || []).map((s) => `${s.agent}:${s.title}`).join('；')}`)
+    else if (m.kind === 'team-step') out.push(`【${m.agent}·${m.title || ''}】${String(m.content || '').replace(/```tool[\s\S]*?```/g, '').replace(/\s+/g, ' ').slice(-500)}`)
+    else if (m.kind === 'team-final') out.push(`【队长汇总】${String(m.content || '').replace(/\s+/g, ' ').slice(-800)}`)
+    else if (m.kind === 'team-meta') out.push(`【状态】${m.content || ''}`)
+    else if (m.kind === 'role-chat' && m.side === 'user') out.push(`【用户】${String(m.content || '').slice(0, 200)}`)
+    else if (m.kind === 'team-ask') out.push(`【协作】${m.from} → ${m.to}：${String(m.question || '').slice(0, 120)}`)
+    else if (m.kind === 'team-ask-done') out.push(`【协作回复】${m.to} → ${m.from}：${String(m.answer || '').slice(0, 120)}`)
+  }
+  let text = out.join('\n')
+  if (text.length > maxChars) text = text.slice(-maxChars) // 保尾部（最新状态）
+  return text ? `【本项目团队会话档案（回忆依据：已完成的任务/步骤/产物/协作；无需再去翻文件确认）】\n${text}` : ''
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -1611,6 +1675,11 @@ async function runTeam(task, opts = {}) {
     send({ type: 'delta', agent: 'leader', text: `\n\n（已兜底：由「${fb.label}」单角色执行该任务）` })
   }
   send({ type: 'plan', summary: plan.summary, steps: plan.steps })
+  // ★ 队长长期记忆：记住这次任务与规划（之后单独对话时不再"失忆"）
+  try {
+    roleChatAppend('leader', 'user', `【团队任务】${String(task).slice(0, 500)}`)
+    roleChatAppend('leader', 'assistant', `【团队任务·我的规划】${plan.summary || ''}\n${plan.steps.map((s, i) => `${i + 1}. ${roleById(s.agent)?.label || s.agent}：${s.title}`).join('\n')}`)
+  } catch { /* ignore */ }
   // ★ 增量保存：计划一出就写入会话（即使中途断开，历史里也能看到任务和计划）
   if (sess) {
     try {
@@ -1636,9 +1705,11 @@ async function runTeam(task, opts = {}) {
     try { agent = getRole(roleId) } catch (e) { await failTask(e.message); return }
     send({ type: 'step_start', index: i, agent: roleId, label: agent.role.label, title: step.title, model: `${agent.provider.name} / ${agent.model}` })
     const contextText = results.map((r) => `【${roleById(r.agent)?.label || r.agent}·${r.title}】\n${r.result.slice(0, 3000)}`).join('\n\n')
+    // ★ 工作区快照：直接给出文件树现状，减少反复 list_files/read_file（省 token、省等待）
+    const digest = await projectDigest(root, 50)
     const messages = [
       { role: 'system', content: roleSystemPrompt(agent.role) },
-      { role: 'user', content: `总任务：${task}\n（当前工作区目录：${root}）\n\n本步骤（${step.title}）：${step.instruction}\n\n此前产出：\n${contextText || '（无）'}` },
+      { role: 'user', content: `总任务：${task}\n（当前工作区目录：${root}）\n\n${digest}\n\n本步骤（${step.title}）：${step.instruction}\n\n此前产出：\n${contextText || '（无）'}\n\n（提示：工作区快照已给出文件现状，请直接据此行动；确需细节时再按需读取个别文件，避免全量重复翻查。）` },
     ]
     // ★ 工具调用限制：角色单独设置优先，否则用全局「团队任务」限制；0=无限
     const roleLimit = effectiveToolLimit(agent.role, 'team')
@@ -1726,6 +1797,8 @@ async function runTeam(task, opts = {}) {
       if (limitHit) stepText += `\n\n（已达到工具调用限制：${limitHit === 'off' ? '已禁用工具调用' : `上限 ${roleLimit} 次`}。可提高设置中的上限，或发送中途指令让该角色继续。）`
       results.push({ agent: roleId, title: step.title, result: stepText })
       send({ type: 'step_done', index: i, agent: roleId, title: step.title, result: stepText })
+      // ★ 写入该角色的长期记忆：之后单独对话/被队友询问时，知道自己在这个任务里做了什么
+      try { roleChatAppend(roleId, 'assistant', `【团队任务·我完成的步骤】${plan.summary ? `（任务：${String(plan.summary).slice(0, 80)}）` : ''}\n${step.title}\n${stepText.replace(/```tool[\s\S]*?```/g, '').slice(0, 1200)}`) } catch { /* ignore */ }
       // ★ 审核/测试判定不通过：自动安排「返工 → 复审」循环（最多 2 轮，避免无限循环）
       const isReviewer = roleId === 'tester' || roleId === 'editor' || /测试|校对|审核|质检/.test(agent.role.label || '')
       if (isReviewer && reworkCount < 2 && STEP_FAIL_RE.test(stepText) && plan.steps.length < 12) {
@@ -1808,6 +1881,11 @@ async function runTeam(task, opts = {}) {
     } catch (e) { send({ type: 'error', message: `队长汇总失败：${e.message}` }) }
   }
 
+  // ★ 队长长期记忆：记住最终汇总（任务收尾后仍可回忆）
+  try {
+    if (finalText) roleChatAppend('leader', 'assistant', `【团队任务·最终汇总】${String(finalText).replace(/```tool[\s\S]*?```/g, '').slice(0, 1500)}`)
+    roleChatAppend('leader', 'user', `【团队任务状态】${run.abort ? '已终止' : (budgetStopped ? '已停止' : '已完成')}（工具调用 ${taskToolCalls} 次，费用 ¥${Number(totalCost.toFixed(6))}）如需继续，请直接说明下一步。`)
+  } catch { /* ignore */ }
   // 4. 记录到团队会话（★ 计划完成与每步完成时已增量保存，这里补最终记录）
   if (sess) {
     try {
@@ -2707,10 +2785,14 @@ if ($res -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dlg.Select
       // ★ 工具根目录跟随该团队会话自己的工作区（缺省才用全局激活工作区）
       const root = sess?.workspace && existsSync(sess.workspace) ? sess.workspace : getActiveRoot()
       const autoState = { approvedAll: false }
-      const userMsg = `【与用户的单独对话】${String(b.message || '').slice(0, 4000)}\n（当前工作区目录：${root}）\n你可以调用工具（如用 ask_role 询问其他队友、读写工作区文件等）。请以你的角色身份直接回复用户（简洁、专业）。`
+      // ★ 上下文复用三件套：角色完整记忆（稳定前缀）+ 团队会话档案 + 工作区快照
+      //   目的：AI 记得自己做过什么，且不用每次重新翻项目文件（省 token、省等待、利于缓存命中）
+      const archive = sessionArchive(sess, 6000)
+      const digest = await projectDigest(root, 50)
+      const userMsg = `【与用户的单独对话】${String(b.message || '').slice(0, 4000)}\n（当前工作区目录：${root}）\n\n${digest}${archive ? '\n\n' + archive : ''}\n\n（提示：以上快照与档案已包含当前进度与产物，请直接据此回答，避免不必要的重复读取；如确需细节再调用工具。你可以用 ask_role 询问队友。请以你的角色身份简洁、专业地回复。）`
       const messages = [
         { role: 'system', content: roleSystemPrompt(role) },
-        ...roleChatHistory(role.id, 12), // ★ 角色自己的对话记忆（含队友协作询问的记录）
+        ...roleChatHistory(role.id), // ★ 完整角色记忆（不再只取最后 12 条）
         { role: 'user', content: userMsg },
       ]
       // ★ 权限：优先用该角色自己的权限设置，未设置则跟随全局默认
